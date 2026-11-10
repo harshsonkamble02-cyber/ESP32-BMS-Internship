@@ -36,9 +36,16 @@ The system monitors a four-cell lithium battery pack, detects abnormal condition
 
 ## Setup Instructions
 1. Open the Wokwi project.
-2. Configure the required Blynk credentials privately.
-3. Run the ESP32 simulation.
-4. Monitor battery readings through the Serial Monitor, LCD and Blynk dashboard.
+## System Architecture Diagram
+
+![BMS Architecture](diagrams/bms_system_architecture.png)
+
+## Workflow Diagram
+
+![BMS Workflow](diagrams/bms_workflow_diagram.png)   
+3. Configure the required Blynk credentials privately.
+4. Run the ESP32 simulation.
+5. Monitor battery readings through the Serial Monitor, LCD and Blynk dashboard.
 
 ## Project Outcome
 The system provides battery monitoring, fault detection, safety control and cloud-based battery intelligence through an integrated embedded platform.
