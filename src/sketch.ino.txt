@@ -1,0 +1,1106 @@
+#define BLYNK_PRINT Serial
+
+#define BLYNK_TEMPLATE_ID "YTMPL32ZmGGBkW"
+#define BLYNK_TEMPLATE_NAME "ESP32 BMS"
+#define BLYNK_AUTH_TOKEN "ij4krbJ0Gti4DJg8s3va-6DswvpSJKHP"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+char ssid[] = "Wokwi-GUEST";
+char pass[] = "";
+
+unsigned long lastWiFiCheck = 0;
+const unsigned long WIFI_CHECK_INTERVAL = 5000;
+
+unsigned long lastBlynkAttempt = 0;
+const unsigned long BLYNK_RETRY_INTERVAL = 10000;
+String faultQueue[10];
+
+int faultHead = 0;
+int faultTail = 0;
+int faultCount = 0;
+// ======================================================
+// ESP32 BMS - TASKS 1, 2, 3 AND 4
+// Fault-Tolerant Embedded Runtime System
+// Wokwi Simulation
+// ======================================================
+
+// ---------------- HARDWARE ----------------
+
+#define NUM_CELLS 4
+
+const int cellPins[NUM_CELLS] = {34, 35, 32, 33};
+
+const int RELAY_PIN = 25;
+const int BUZZER_PIN = 26;
+const int RELAY_FEEDBACK_PIN = 27;
+
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ---------------- BATTERY SETTINGS ----------------
+
+// Wokwi potentiometer mapping: 0 to 4.2 V
+const float CELL_SIM_MAX_V = 4.20f;
+
+const float OVER_VOLTAGE = 4.20f;
+const float UNDER_VOLTAGE = 3.00f;
+
+const float DISCONNECTED_VOLTAGE = 0.10f;
+const float INVALID_VOLTAGE = 4.50f;
+
+const float MINOR_IMBALANCE = 0.05f;
+const float CRITICAL_IMBALANCE = 0.15f;
+
+// ADC saturation threshold
+const int ADC_SATURATION_RAW = 4090;
+
+// ---------------- TIMING SETTINGS ----------------
+
+const unsigned long SAMPLE_INTERVAL_MS = 1000;
+
+const unsigned long RELAY_MISMATCH_DELAY_MS = 500;
+const unsigned long RELAY_RECOVERY_MS = 2000;
+
+const unsigned long SCREEN_INTERVAL_MS = 3000;
+
+const int FROZEN_LIMIT = 10;
+const int ADC_CHANGE_THRESHOLD = 5;
+
+// ---------------- SYSTEM MODES ----------------
+
+enum SystemMode {
+  NORMAL,
+  DEGRADED,
+  FAILSAFE,
+  SHUTDOWN
+};
+
+SystemMode currentMode = NORMAL;
+
+// ---------------- BATTERY VARIABLES ----------------
+
+float cellVoltage[NUM_CELLS] = {0};
+
+int rawAdc[NUM_CELLS] = {0};
+
+int previousRawAdc[NUM_CELLS] = {
+  -1, -1, -1, -1
+};
+
+int frozenCount[NUM_CELLS] = {0};
+
+float packVoltage = 0;
+float averageVoltage = 0;
+
+float highestCell = 0;
+float lowestCell = 0;
+float imbalance = 0;
+
+int highestCellNumber = 0;
+int lowestCellNumber = 0;
+
+String batteryStatus = "Starting";
+
+// ---------------- FAULT VARIABLES ----------------
+
+bool cellSensorFault[NUM_CELLS] = {false};
+bool cellInvalidFault[NUM_CELLS] = {false};
+bool cellFrozenFault[NUM_CELLS] = {false};
+
+bool faultState = false;
+
+bool relayMismatch = false;
+bool commandedRelayState = false;
+
+// ---------------- TIME VARIABLES ----------------
+
+unsigned long lastSampleMillis = 0;
+unsigned long lastScreenChange = 0;
+
+unsigned long relayMismatchStart = 0;
+unsigned long relayMatchStart = 0;
+
+int currentScreen = 0;
+
+// ======================================================
+// TIMESTAMPED EVENT LOGGING
+// ======================================================
+
+void logEvent(const String &message) {
+
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms] ");
+
+  Serial.println(message);
+}
+
+void sendBlynkTelemetry()
+{
+  if (!Blynk.connected()) return;
+
+  // Calculate battery risk level
+  String riskLevel = "NORMAL";
+
+  if (currentMode == SHUTDOWN ||
+      currentMode == FAILSAFE ||
+      batteryStatus == "Pack Failure")
+  {
+    riskLevel = "FAILURE";
+  }
+  else if (imbalance > CRITICAL_IMBALANCE)
+  {
+    riskLevel = "CRITICAL";
+  }
+  else if (currentMode == DEGRADED ||
+           imbalance > MINOR_IMBALANCE)
+  {
+    riskLevel = "WARNING";
+  }
+
+  // Generate operator recommendation
+  String recommendation = "System Normal";
+
+  if (currentMode == SHUTDOWN)
+  {
+    recommendation = "Shutdown: Inspect Sensors";
+  }
+  else if (relayMismatch)
+  {
+    recommendation = "Inspect Relay Feedback";
+  }
+  else if (currentMode == FAILSAFE)
+  {
+    recommendation = "Critical: Inspect Battery";
+  }
+  else if (currentMode == DEGRADED)
+  {
+    recommendation = "Check Cell Sensors";
+  }
+  else if (imbalance > CRITICAL_IMBALANCE)
+  {
+    recommendation = "Balance Battery Cells";
+  }
+  else if (imbalance > MINOR_IMBALANCE)
+  {
+    recommendation = "Monitor Cell Imbalance";
+  }
+
+  // Previous telemetry values
+  static bool firstSend = true;
+  static float oldCell[4] = {-1, -1, -1, -1};
+  static float oldPack = -1;
+  static float oldAverage = -1;
+  static float oldImbalance = -1;
+  static int oldMode = -1;
+  static int oldRSSI = 999;
+  static bool oldRelay = false;
+  static bool oldMismatch = false;
+  static String oldBattery = "";
+  static String oldRisk = "";
+  static String oldRecommendation = "";
+
+  bool changed = firstSend;
+
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    if (firstSend ||
+        fabs(cellVoltage[i] - oldCell[i]) >= 0.02)
+    {
+      changed = true;
+    }
+  }
+
+  if (firstSend ||
+      fabs(packVoltage - oldPack) >= 0.02 ||
+      fabs(averageVoltage - oldAverage) >= 0.02 ||
+      fabs(imbalance - oldImbalance) >= 0.02 ||
+      oldMode != (int)currentMode ||
+      oldRSSI != WiFi.RSSI() ||
+      oldRelay != commandedRelayState ||
+      oldMismatch != relayMismatch ||
+      oldBattery != batteryStatus ||
+      oldRisk != riskLevel ||
+      oldRecommendation != recommendation)
+  {
+    changed = true;
+  }
+
+  if (!changed) return;
+
+  // Send live battery telemetry
+  Blynk.virtualWrite(V0, cellVoltage[0]);
+  Blynk.virtualWrite(V1, cellVoltage[1]);
+  Blynk.virtualWrite(V2, cellVoltage[2]);
+  Blynk.virtualWrite(V3, cellVoltage[3]);
+
+  Blynk.virtualWrite(V4, packVoltage);
+  Blynk.virtualWrite(V5, averageVoltage);
+  Blynk.virtualWrite(V6, imbalance);
+
+  Blynk.virtualWrite(V7, batteryStatus);
+
+  String modeText =
+    currentMode == NORMAL ? "NORMAL" :
+    currentMode == DEGRADED ? "DEGRADED" :
+    currentMode == FAILSAFE ? "FAILSAFE" : "SHUTDOWN";
+
+  Blynk.virtualWrite(V8, modeText);
+  Blynk.virtualWrite(V9, commandedRelayState ? "ON" : "OFF");
+  Blynk.virtualWrite(V10, WiFi.RSSI());
+
+  // TASK 6: Executive dashboard
+  Blynk.virtualWrite(V12, riskLevel);
+  Blynk.virtualWrite(V13, recommendation);
+
+  // Save previous values
+  for (int i = 0; i < NUM_CELLS; i++)
+  {
+    oldCell[i] = cellVoltage[i];
+  }
+
+  oldPack = packVoltage;
+  oldAverage = averageVoltage;
+  oldImbalance = imbalance;
+  oldMode = (int)currentMode;
+  oldRSSI = WiFi.RSSI();
+  oldRelay = commandedRelayState;
+  oldMismatch = relayMismatch;
+  oldBattery = batteryStatus;
+  oldRisk = riskLevel;
+  oldRecommendation = recommendation;
+
+  firstSend = false;
+}
+
+void sendFaultEvent(String message)
+{
+  if (Blynk.connected() && faultCount == 0)
+  {
+    Blynk.virtualWrite(V11, message);
+    return;
+  }
+
+  if (faultCount >= 10)
+  {
+    faultHead = (faultHead + 1) % 10;
+    faultCount--;
+  }
+
+  faultQueue[faultTail] = message;
+  faultTail = (faultTail + 1) % 10;
+  faultCount++;
+
+  Serial.println("Fault event stored in queue.");
+}
+void flushFaultQueue()
+{
+  while (Blynk.connected() && faultCount > 0)
+  {
+    Blynk.virtualWrite(V11, faultQueue[faultHead]);
+
+    faultHead = (faultHead + 1) % 10;
+    faultCount--;
+  }
+}
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+  analogReadResolution(12);
+
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  // GPIO25 to GPIO27 feedback connection
+  pinMode(RELAY_FEEDBACK_PIN, INPUT_PULLUP);
+
+  // Safe initial condition
+  commandedRelayState = false;
+
+  digitalWrite(RELAY_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  lcd.setCursor(0, 0);
+  lcd.print("BMS Starting");
+
+  lcd.setCursor(0, 1);
+  lcd.print("Task 4 Runtime");
+
+  logEvent("Battery Management System Started");
+
+  logEvent("Task 4 Runtime Monitoring Ready");
+  WiFi.begin(ssid, pass, 6);
+
+  WiFi.setAutoReconnect(true);
+
+  Serial.print("WiFi Status: ");
+Serial.println(WiFi.status());
+
+Serial.println("Connecting to WiFi...");
+
+Blynk.config(BLYNK_AUTH_TOKEN, "blynk.cloud", 80);
+}
+
+// ======================================================
+// TASK 1: READ CELL VOLTAGES
+// ======================================================
+
+void readCellVoltages() {
+
+  packVoltage = 0;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    rawAdc[i] = analogRead(cellPins[i]);
+
+    cellVoltage[i] =
+      (rawAdc[i] / 4095.0f) * CELL_SIM_MAX_V;
+
+    packVoltage += cellVoltage[i];
+  }
+
+  averageVoltage = packVoltage / NUM_CELLS;
+}
+
+// ======================================================
+// FIND HIGHEST AND LOWEST CELL
+// ======================================================
+
+void findCellLimits() {
+
+  highestCell = cellVoltage[0];
+  lowestCell = cellVoltage[0];
+
+  highestCellNumber = 0;
+  lowestCellNumber = 0;
+
+  for (int i = 1; i < NUM_CELLS; i++) {
+
+    if (cellVoltage[i] > highestCell) {
+
+      highestCell = cellVoltage[i];
+      highestCellNumber = i;
+    }
+
+    if (cellVoltage[i] < lowestCell) {
+
+      lowestCell = cellVoltage[i];
+      lowestCellNumber = i;
+    }
+  }
+}
+
+// ======================================================
+// CALCULATE IMBALANCE
+// ======================================================
+
+void calculateImbalance() {
+
+  imbalance = highestCell - lowestCell;
+}
+
+// ======================================================
+// TASK 4: SENSOR DISCONNECTION DETECTION
+// ======================================================
+
+void checkSensorFaults() {
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    bool disconnected =
+      (cellVoltage[i] <= DISCONNECTED_VOLTAGE);
+
+    if (disconnected && !cellSensorFault[i]) {
+
+      logEvent(
+        "FAULT: Cell " + String(i + 1) +
+        " Sensor Disconnected"
+      );
+
+      sendFaultEvent(
+        "FAULT: Cell " + String(i + 1) +
+        " Sensor Disconnected"
+      );
+
+    }
+    else if (!disconnected && cellSensorFault[i]) {
+
+      logEvent(
+        "RECOVERY: Cell " + String(i + 1) +
+        " Sensor Reading Restored"
+      );
+
+      sendFaultEvent(
+        "RECOVERY: Cell " + String(i + 1) +
+        " Sensor Reading Restored"
+      );
+
+    }
+
+    cellSensorFault[i] = disconnected;
+  }
+}
+
+void checkInvalidReadings() {
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    bool invalid =
+      (!isfinite(cellVoltage[i]) ||
+       cellVoltage[i] < 0.0f ||
+       cellVoltage[i] > INVALID_VOLTAGE ||
+       rawAdc[i] >= ADC_SATURATION_RAW);
+
+    if (invalid && !cellInvalidFault[i]) {
+
+      logEvent(
+        "FAULT: Cell " + String(i + 1) +
+        " Invalid ADC Reading"
+      );
+    }
+
+    else if (!invalid && cellInvalidFault[i]) {
+
+      logEvent(
+        "RECOVERY: Cell " + String(i + 1) +
+        " ADC Reading Valid"
+      );
+    }
+
+    cellInvalidFault[i] = invalid;
+  }
+}
+
+// ======================================================
+// TASK 4: FROZEN ADC DETECTION
+// ======================================================
+
+void checkFrozenADC() {
+
+  bool anotherChannelChanged = false;
+
+  // Detect changing ADC channels
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    if (previousRawAdc[i] >= 0 &&
+        abs(rawAdc[i] - previousRawAdc[i])
+        > ADC_CHANGE_THRESHOLD) {
+
+      anotherChannelChanged = true;
+    }
+  }
+
+  // Check individual ADC channels
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    // Isolate disconnected or invalid channels
+
+    if (cellSensorFault[i] || cellInvalidFault[i]) {
+
+      frozenCount[i] = 0;
+      previousRawAdc[i] = rawAdc[i];
+
+      if (cellFrozenFault[i]) {
+
+        cellFrozenFault[i] = false;
+
+        logEvent(
+          "RECOVERY: Cell " + String(i + 1) +
+          " Frozen ADC Cleared"
+        );
+      }
+
+      continue;
+    }
+
+    // Initial ADC sample
+
+    if (previousRawAdc[i] < 0) {
+
+      previousRawAdc[i] = rawAdc[i];
+
+      continue;
+    }
+
+    // Detect an unchanged channel while another changes
+
+    if (rawAdc[i] == previousRawAdc[i] &&
+        anotherChannelChanged) {
+
+      frozenCount[i]++;
+    }
+
+    else if (rawAdc[i] != previousRawAdc[i]) {
+
+      frozenCount[i] = 0;
+
+      if (cellFrozenFault[i]) {
+
+        cellFrozenFault[i] = false;
+
+        logEvent(
+          "RECOVERY: Cell " + String(i + 1) +
+          " ADC Reading Changed"
+        );
+      }
+    }
+
+    // Frozen ADC fault
+
+    if (frozenCount[i] >= FROZEN_LIMIT &&
+        !cellFrozenFault[i]) {
+
+      cellFrozenFault[i] = true;
+
+      logEvent(
+        "FAULT: Cell " + String(i + 1) +
+        " ADC Possibly Frozen"
+      );
+    }
+
+    previousRawAdc[i] = rawAdc[i];
+  }
+}
+
+// ======================================================
+// TASK 1: BATTERY HEALTH
+// ======================================================
+
+void checkBatteryHealth() {
+
+  faultState = false;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    if (cellInvalidFault[i] ||
+        cellSensorFault[i] ||
+        cellVoltage[i] >= OVER_VOLTAGE ||
+        cellVoltage[i] <= UNDER_VOLTAGE) {
+
+      batteryStatus = "Pack Failure";
+
+      faultState = true;
+
+      return;
+    }
+  }
+
+  if (imbalance <= MINOR_IMBALANCE) {
+
+    batteryStatus = "Healthy";
+  }
+
+  else if (imbalance <= CRITICAL_IMBALANCE) {
+
+    batteryStatus = "Minor Imbalance";
+  }
+
+  else {
+
+    batteryStatus = "Critical Imbalance";
+
+    faultState = true;
+  }
+
+  // Report a frozen sensor separately
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    if (cellFrozenFault[i]) {
+
+      batteryStatus = "Sensor Degraded";
+      return;
+    }
+  }
+}
+
+// ======================================================
+// TASK 4: SYSTEM MODE MANAGEMENT
+// ======================================================
+
+void updateSystemMode() {
+
+  bool invalidFault = false;
+  bool sensorOrFrozenFault = false;
+  bool batteryFault = false;
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    if (cellInvalidFault[i]) {
+
+      invalidFault = true;
+    }
+
+    if (cellSensorFault[i] ||
+        cellFrozenFault[i]) {
+
+      sensorOrFrozenFault = true;
+    }
+
+    if (cellVoltage[i] >= OVER_VOLTAGE ||
+        cellVoltage[i] <= UNDER_VOLTAGE) {
+
+      batteryFault = true;
+    }
+  }
+
+  SystemMode oldMode = currentMode;
+
+  // Highest priority: invalid ADC
+  if (invalidFault) {
+
+    currentMode = SHUTDOWN;
+  }
+
+  // Serious battery or relay faults
+  else if (relayMismatch ||
+           batteryFault ||
+           batteryStatus == "Critical Imbalance") {
+
+    currentMode = FAILSAFE;
+  }
+
+  // Isolated sensor fault
+  else if (sensorOrFrozenFault) {
+
+    currentMode = DEGRADED;
+  }
+
+  else {
+
+    currentMode = NORMAL;
+  }
+
+  // Log mode transitions
+
+  if (currentMode != oldMode) {
+
+    Serial.print("[");
+    Serial.print(millis());
+    Serial.print(" ms] SYSTEM MODE: ");
+
+    switch (currentMode) {
+
+      case NORMAL:
+        Serial.println("NORMAL");
+        break;
+
+      case DEGRADED:
+        Serial.println("DEGRADED");
+        break;
+
+      case FAILSAFE:
+        Serial.println("FAILSAFE");
+        break;
+
+      case SHUTDOWN:
+        Serial.println("SHUTDOWN");
+        break;
+    }
+  }
+}
+
+// ======================================================
+// TASK 4: RELAY MISMATCH DETECTION
+// ======================================================
+
+void checkRelayMismatch() {
+
+  bool actualRelayState =
+    (digitalRead(RELAY_FEEDBACK_PIN) == HIGH);
+
+  if (actualRelayState != commandedRelayState) {
+
+    relayMatchStart = 0;
+
+    if (relayMismatchStart == 0) {
+
+      relayMismatchStart = millis();
+    }
+
+    if (!relayMismatch &&
+        millis() - relayMismatchStart >=
+        RELAY_MISMATCH_DELAY_MS) {
+
+      relayMismatch = true;
+
+      logEvent("FAULT: Relay Mismatch Detected");
+    }
+  }
+
+  else {
+
+    relayMismatchStart = 0;
+
+    if (relayMismatch) {
+
+      if (relayMatchStart == 0) {
+
+        relayMatchStart = millis();
+      }
+
+      if (millis() - relayMatchStart >=
+          RELAY_RECOVERY_MS) {
+
+        relayMismatch = false;
+
+        relayMatchStart = 0;
+
+        logEvent(
+          "RECOVERY: Relay Feedback Matches Command"
+        );
+      }
+    }
+
+    else {
+
+      relayMatchStart = 0;
+    }
+  }
+}
+
+// ======================================================
+// TASK 2: RELAY AND BUZZER PROTECTION
+// ======================================================
+
+void protectionControl() {
+
+  bool protectionRequired =
+    (currentMode != NORMAL) ||
+    faultState ||
+    relayMismatch;
+
+  bool newCommand = !protectionRequired;
+
+  if (newCommand != commandedRelayState) {
+
+    commandedRelayState = newCommand;
+
+    if (commandedRelayState) {
+
+      logEvent("Relay Command Changed to ON");
+    }
+
+    else {
+
+      logEvent("Relay Command Changed to OFF");
+    }
+  }
+
+  digitalWrite(
+    RELAY_PIN,
+    commandedRelayState ? HIGH : LOW
+  );
+
+  digitalWrite(
+    BUZZER_PIN,
+    protectionRequired ? HIGH : LOW
+  );
+}
+
+// ======================================================
+// TASK 3: LCD HMI
+// ======================================================
+
+void clearLCDLine(int row) {
+
+  lcd.setCursor(0, row);
+
+  lcd.print("                ");
+}
+
+void updateHMI() {
+
+  unsigned long now = millis();
+
+  // Critical mode screen
+
+  if (currentMode == SHUTDOWN ||
+      currentMode == FAILSAFE) {
+
+    clearLCDLine(0);
+    clearLCDLine(1);
+
+    lcd.setCursor(0, 0);
+
+    lcd.print(
+      currentMode == SHUTDOWN ?
+      "MODE: SHUTDOWN" : "MODE: FAILSAFE"
+    );
+
+    lcd.setCursor(0, 1);
+
+    lcd.print(batteryStatus.substring(0, 16));
+
+    return;
+  }
+
+  // Screen rotation
+
+  if (now - lastScreenChange >= SCREEN_INTERVAL_MS) {
+
+    lastScreenChange = now;
+
+    currentScreen = (currentScreen + 1) % 3;
+
+    lcd.clear();
+  }
+
+  // Screen 1: individual cells
+
+  if (currentScreen == 0) {
+
+    clearLCDLine(0);
+    clearLCDLine(1);
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("C1:");
+    lcd.print(cellVoltage[0], 2);
+
+    lcd.print(" C2:");
+    lcd.print(cellVoltage[1], 2);
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("C3:");
+    lcd.print(cellVoltage[2], 2);
+
+    lcd.print(" C4:");
+    lcd.print(cellVoltage[3], 2);
+  }
+
+  // Screen 2: pack voltage and imbalance
+
+  else if (currentScreen == 1) {
+
+    clearLCDLine(0);
+    clearLCDLine(1);
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("Pack:");
+    lcd.print(packVoltage, 2);
+    lcd.print("V");
+
+    lcd.setCursor(0, 1);
+
+    lcd.print("Diff:");
+    lcd.print(imbalance, 3);
+    lcd.print("V");
+  }
+
+  // Screen 3: system status
+
+  else {
+
+    clearLCDLine(0);
+    clearLCDLine(1);
+
+    lcd.setCursor(0, 0);
+
+    lcd.print("Mode:");
+
+    switch (currentMode) {
+
+      case NORMAL:
+        lcd.print("NORMAL");
+        break;
+
+      case DEGRADED:
+        lcd.print("DEGRADED");
+        break;
+
+      case FAILSAFE:
+        lcd.print("FAILSAFE");
+        break;
+
+      case SHUTDOWN:
+        lcd.print("SHUTDOWN");
+        break;
+    }
+
+    lcd.setCursor(0, 1);
+
+    lcd.print(batteryStatus.substring(0, 16));
+  }
+}
+
+// ======================================================
+// SERIAL MONITOR DIAGNOSTICS
+// ======================================================
+
+void printSerialData() {
+
+  Serial.println("---------------------");
+  Serial.println("Battery Monitoring");
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    Serial.print("Cell ");
+    Serial.print(i + 1);
+    Serial.print(": ");
+
+    Serial.print(cellVoltage[i], 2);
+    Serial.println(" V");
+  }
+
+  Serial.print("Pack Voltage: ");
+  Serial.print(packVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Average Voltage: ");
+  Serial.print(averageVoltage, 2);
+  Serial.println(" V");
+
+  Serial.print("Weakest Cell: Cell ");
+  Serial.println(lowestCellNumber + 1);
+
+  Serial.print("Strongest Cell: Cell ");
+  Serial.println(highestCellNumber + 1);
+
+  Serial.print("Imbalance: ");
+  Serial.print(imbalance, 3);
+  Serial.println(" V");
+
+  Serial.print("Battery Status: ");
+  Serial.println(batteryStatus);
+
+  Serial.print("SYSTEM MODE: ");
+
+  switch (currentMode) {
+
+    case NORMAL:
+      Serial.println("NORMAL");
+      break;
+
+    case DEGRADED:
+      Serial.println("DEGRADED");
+      break;
+
+    case FAILSAFE:
+      Serial.println("FAILSAFE");
+      break;
+
+    case SHUTDOWN:
+      Serial.println("SHUTDOWN");
+      break;
+  }
+
+  Serial.print("Relay Command: ");
+  Serial.println(commandedRelayState ? "ON" : "OFF");
+
+  Serial.print("Relay Mismatch: ");
+  Serial.println(relayMismatch ? "YES" : "NO");
+
+  Serial.println("Cell Fault Details:");
+
+  for (int i = 0; i < NUM_CELLS; i++) {
+
+    Serial.print("Cell ");
+    Serial.print(i + 1);
+
+    Serial.print(" Sensor:");
+    Serial.print(cellSensorFault[i] ? "FAULT" : "OK");
+
+    Serial.print(" Invalid:");
+    Serial.print(cellInvalidFault[i] ? "FAULT" : "OK");
+
+    Serial.print(" Frozen:");
+    Serial.println(cellFrozenFault[i] ? "FAULT" : "OK");
+  }
+
+  Serial.println("---------------------");
+}
+
+// ======================================================
+// MAIN LOOP - NON-BLOCKING
+// ======================================================
+
+
+void loop()
+{
+  unsigned long now = millis();
+
+  // 1. WiFi connection monitoring
+  static bool previousWiFiState = false;
+
+  bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+  if (wifiConnected && !previousWiFiState)
+  {
+    Serial.println("WiFi Connected!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  }
+
+  if (!wifiConnected && previousWiFiState)
+  {
+    Serial.println("WiFi Disconnected!");
+  }
+
+  previousWiFiState = wifiConnected;
+
+  // 2. Blynk connection management
+  if (wifiConnected)
+  {
+    if (!Blynk.connected())
+    {
+      if (now - lastBlynkAttempt >= BLYNK_RETRY_INTERVAL)
+      {
+        lastBlynkAttempt = now;
+
+        Serial.println("Connecting to Blynk...");
+
+        if (Blynk.connect(5000))
+        {
+          Serial.println("BLYNK CONNECTED!");
+        }
+        else
+        {
+          Serial.println("BLYNK CONNECTION FAILED!");
+        }
+      }
+    }
+
+    if (Blynk.connected())
+    {
+      Blynk.run();
+      flushFaultQueue();
+      sendBlynkTelemetry();
+    }
+  }
+
+  // 3. Existing BMS monitoring
+  if (now - lastSampleMillis >= SAMPLE_INTERVAL_MS)
+  {
+    lastSampleMillis = now;
+
+    readCellVoltages();
+    findCellLimits();
+    calculateImbalance();
+    checkSensorFaults();
+    checkInvalidReadings();
+    checkFrozenADC();
+    checkBatteryHealth();
+    updateSystemMode();
+    protectionControl();
+    checkRelayMismatch();
+    updateSystemMode();
+    protectionControl();
+    updateHMI();
+    printSerialData();
+  }
+}
