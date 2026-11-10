@@ -1,0 +1,15 @@
+# BMS Project – Bug Log
+
+| No. | Issue Identified | Solution / Resolution |
+|---|---|---|
+| 1 | ESP32 compilation errors due to incorrect braces and else statements. | Corrected the function structure and matching braces. |
+| 2 | Battery cell readings showed zero or incorrect values. | Checked and corrected the cell input connections and ADC readings. |
+| 3 | Sensor disconnection was not initially handled correctly. | Implemented sensor fault detection and system mode updates. |
+| 4 | Frozen ADC readings caused false fault detection. | Improved frozen ADC detection using a threshold and consecutive sample counter. |
+| 5 | Relay feedback configuration needed verification. | Added relay feedback monitoring and mismatch detection logic. |
+| 6 | Blynk historical charts did not display all cell readings clearly in one chart. | Created separate historical chart widgets for each cell. |
+| 7 | Cloud telemetry required reconnection handling. | Implemented Wi-Fi/Blynk reconnection and fault event synchronization. |
+| 8 | Dashboard risk and recommendation values needed validation. | Tested critical imbalance and healthy recovery conditions. |
+
+## Conclusion
+The identified development issues were addressed through code corrections, simulation testing, and dashboard validation. Remaining unverified conditions should be tested before final submission.
